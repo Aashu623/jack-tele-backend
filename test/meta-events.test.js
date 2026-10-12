@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildCapiEvent, sha256 } = require("../lib/metaCapi");
+const { buildCapiEvent, isValidCurrency, sha256 } = require("../lib/metaCapi");
 
 function context() {
   return {
@@ -228,4 +228,112 @@ test("strips unknown custom_data keys", () => {
   assert.equal(result.event.custom_data.currency, "USD");
   assert.equal(result.event.custom_data.secret, undefined);
   assert.equal(result.event.custom_data.injected, undefined);
+});
+
+// ── Subscribe with currency/value (server-side verified) ──────────────────
+
+test("Subscribe includes numeric value and ISO currency when provided", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Subscribe",
+      event_id: "sub_currency1234",
+      event_source_url: "https://example.com/landing",
+      fbp: VALID_FBP,
+      custom_data: { value: 0, currency: "INR" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.equal(result.event.custom_data.value, 0);
+  assert.equal(result.event.custom_data.currency, "INR");
+});
+
+test("Subscribe value as numeric string is coerced to number", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Subscribe",
+      event_id: "sub_coerce12345",
+      fbp: VALID_FBP,
+      custom_data: { value: "499.00", currency: "INR" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.strictEqual(result.event.custom_data.value, 499);
+  assert.equal(typeof result.event.custom_data.value, "number");
+});
+
+test("Subscribe value zero is preserved (free channel)", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Subscribe",
+      event_id: "sub_zerovalu12",
+      fbp: VALID_FBP,
+      custom_data: { value: 0, currency: "USD" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.strictEqual(result.event.custom_data.value, 0);
+});
+
+test("lowercase currency is normalised to uppercase", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Subscribe",
+      event_id: "sub_lowercase12",
+      fbp: VALID_FBP,
+      custom_data: { value: 0, currency: "inr" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.equal(result.event.custom_data.currency, "INR");
+});
+
+test("invalid currency code is dropped silently", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Lead",
+      event_id: "lead_badcurr123",
+      fbp: VALID_FBP,
+      custom_data: { value: 9.99, currency: "NOTACURRENCY" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.equal(result.event.custom_data.currency, undefined);
+  assert.equal(result.event.custom_data.value, 9.99);
+});
+
+test("non-numeric string value is dropped", () => {
+  const result = buildCapiEvent(
+    {
+      event_name: "Lead",
+      event_id: "lead_badval1234",
+      fbp: VALID_FBP,
+      custom_data: { value: "free", currency: "USD" },
+    },
+    context(),
+  );
+  assert.ok(result.event);
+  assert.equal(result.event.custom_data.value, undefined);
+});
+
+// ── isValidCurrency ───────────────────────────────────────────────────────
+
+test("isValidCurrency accepts valid ISO 4217 codes", () => {
+  assert.ok(isValidCurrency("USD"));
+  assert.ok(isValidCurrency("INR"));
+  assert.ok(isValidCurrency("EUR"));
+  assert.ok(isValidCurrency("inr")); // lowercase accepted — normalised internally
+});
+
+test("isValidCurrency rejects invalid inputs", () => {
+  assert.ok(!isValidCurrency("US"));         // too short
+  assert.ok(!isValidCurrency("USDD"));       // too long
+  assert.ok(!isValidCurrency("123"));        // digits
+  assert.ok(!isValidCurrency(""));           // empty
+  assert.ok(!isValidCurrency(null));         // non-string
+  assert.ok(!isValidCurrency(undefined));    // non-string
 });

@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const crypto = require("crypto");
 const express = require("express");
-const { buildCapiEvent, getCapiEndpoint } = require("./lib/metaCapi");
+const { buildCapiEvent, getCapiEndpoint, isValidCurrency } = require("./lib/metaCapi");
 const {
   isMemberJoin,
   getJoinedUserId,
@@ -26,6 +26,14 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
 const TELEGRAM_CHANNEL_ID = (process.env.TELEGRAM_CHANNEL_ID || "").trim();
 const TELEGRAM_INVITE_LINK = (process.env.TELEGRAM_INVITE_LINK || "").trim();
+const SUBSCRIBE_CURRENCY_RAW = (process.env.SUBSCRIBE_CURRENCY || "USD").trim().toUpperCase();
+const SUBSCRIBE_CURRENCY = isValidCurrency(SUBSCRIBE_CURRENCY_RAW) ? SUBSCRIBE_CURRENCY_RAW : null;
+const SUBSCRIBE_VALUE = (() => {
+  const raw = process.env.SUBSCRIBE_VALUE;
+  if (raw === undefined || raw === "") return 0;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+})();
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
@@ -110,10 +118,11 @@ function logSafe(message, extra) {
 // Builds a Subscribe CAPI event and dispatches it to Meta.
 // Used exclusively by the Telegram webhook handler after verified membership.
 async function sendSubscribeEvent(eventId, capiBody, requestContext) {
-  const built = buildCapiEvent(
-    { event_name: "Subscribe", event_id: eventId, ...capiBody },
-    requestContext,
-  );
+  const body = { event_name: "Subscribe", event_id: eventId, ...capiBody };
+  if (SUBSCRIBE_CURRENCY) {
+    body.custom_data = { value: SUBSCRIBE_VALUE, currency: SUBSCRIBE_CURRENCY };
+  }
+  const built = buildCapiEvent(body, requestContext);
   if (built.error) {
     logSafe("Subscribe CAPI build failed after Telegram join.", { reason: built.error });
     return;
@@ -355,6 +364,12 @@ if (require.main === module) {
       console.log(
         `[${level}] META_TEST_EVENT_CODE is set — events go to Test Events, not real conversions.` +
           (NODE_ENV === "production" ? " Remove it before going live." : ""),
+      );
+    }
+    if (!SUBSCRIBE_CURRENCY) {
+      console.log(
+        "[WARN] SUBSCRIBE_CURRENCY is not set or invalid — Subscribe CAPI events will be sent without currency/value custom_data. " +
+          "Set SUBSCRIBE_CURRENCY to a valid ISO 4217 code (e.g. INR, USD) to resolve the Meta Events Manager currency error.",
       );
     }
   });
