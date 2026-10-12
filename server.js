@@ -1,7 +1,15 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const { buildCapiEvent, getCapiEndpoint } = require("./lib/metaCapi");
+const {
+  isMemberJoin,
+  getJoinedUserId,
+  getUpdateChannelId,
+  parseStartToken,
+  getMessageUserId,
+} = require("./lib/telegramWebhook");
 
 const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 const PIXEL_ID = (process.env.META_PIXEL_ID || "").trim();
@@ -14,6 +22,11 @@ const GRAPH_VERSION = process.env.META_GRAPH_API_VERSION || "v21.0";
 const TEST_EVENT_CODE = (process.env.META_TEST_EVENT_CODE || "").trim();
 const NODE_ENV = process.env.NODE_ENV || "development";
 
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const TELEGRAM_WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+const TELEGRAM_CHANNEL_ID = (process.env.TELEGRAM_CHANNEL_ID || "").trim();
+const TELEGRAM_INVITE_LINK = (process.env.TELEGRAM_INVITE_LINK || "").trim();
+
 const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -22,6 +35,17 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
 const rateBuckets = new Map();
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_MAX = 40;
+
+// Attribution sessions: browser identity stored between button click and bot /start.
+// Map<token, { fbp, fbc, eventSourceUrl, leadEventId, clientIp, userAgent, telegramUserId, createdAt }>
+const sessionStore = new Map();
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [k, v] of sessionStore) {
+    if (v.createdAt < cutoff) sessionStore.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
 
 function getClientIp(req) {
   const forwarded = req.headers["x-forwarded-for"];
@@ -83,6 +107,103 @@ function logSafe(message, extra) {
   }
 }
 
+// Builds a Subscribe CAPI event and dispatches it to Meta.
+// Used exclusively by the Telegram webhook handler after verified membership.
+async function sendSubscribeEvent(eventId, capiBody, requestContext) {
+  const built = buildCapiEvent(
+    { event_name: "Subscribe", event_id: eventId, ...capiBody },
+    requestContext,
+  );
+  if (built.error) {
+    logSafe("Subscribe CAPI build failed after Telegram join.", { reason: built.error });
+    return;
+  }
+  const payload = { data: [built.event], access_token: ACCESS_TOKEN };
+  if (TEST_EVENT_CODE) payload.test_event_code = TEST_EVENT_CODE;
+  try {
+    const resp = await fetch(getCapiEndpoint(PIXEL_ID, GRAPH_VERSION), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const rb = await resp.json().catch(() => ({}));
+      logSafe("Subscribe CAPI rejected.", { status: resp.status, error_type: rb.error?.type });
+    }
+  } catch (err) {
+    logSafe("Subscribe CAPI network error.", { reason: err?.name });
+  }
+}
+
+// Processes one Telegram Bot API update asynchronously (after the webhook has responded).
+async function handleTelegramUpdate(update) {
+  // /start <token> — user opened the bot via the attribution deep link.
+  // Store their Telegram ID against the session, then deliver the channel invite link.
+  const token = parseStartToken(update);
+  if (token) {
+    const tgUserId = getMessageUserId(update);
+    const session = sessionStore.get(token);
+    if (session && tgUserId != null) {
+      session.telegramUserId = tgUserId;
+      if (TELEGRAM_INVITE_LINK && TELEGRAM_BOT_TOKEN) {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: tgUserId,
+            text: "Tap below to join the channel:",
+            reply_markup: {
+              inline_keyboard: [[{ text: "Join Channel ✈", url: TELEGRAM_INVITE_LINK }]],
+            },
+          }),
+        }).catch(() => {});
+      }
+    }
+    return;
+  }
+
+  // chat_member update — user joined (or was added to) a chat.
+  if (!isMemberJoin(update)) return;
+
+  // Ignore joins to other channels/groups if TELEGRAM_CHANNEL_ID is configured.
+  const channelId = getUpdateChannelId(update);
+  if (TELEGRAM_CHANNEL_ID && channelId !== TELEGRAM_CHANNEL_ID) return;
+
+  if (!PIXEL_ID || !ACCESS_TOKEN) return;
+
+  const tgUserId = getJoinedUserId(update);
+
+  // Find the attribution session that was linked to this Telegram user via /start.
+  let session = null;
+  let sessionKey = null;
+  for (const [k, s] of sessionStore) {
+    if (s.telegramUserId === tgUserId) {
+      session = s;
+      sessionKey = k;
+      break;
+    }
+  }
+  if (sessionKey) sessionStore.delete(sessionKey);
+
+  // No session means the user joined via the direct invite link (no bot interaction).
+  // We have no browser identity to attach, so we skip the Subscribe event.
+  if (!session) return;
+
+  const subscribeEventId = `sub_tg_${tgUserId}_${Date.now()}`;
+  await sendSubscribeEvent(
+    subscribeEventId,
+    {
+      event_source_url: session.eventSourceUrl,
+      fbp: session.fbp,
+      fbc: session.fbc,
+    },
+    {
+      clientIp: session.clientIp,
+      userAgent: session.userAgent,
+    },
+  );
+}
+
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "16kb" }));
@@ -101,7 +222,45 @@ app.get("/health", (_req, res) => {
     pixelConfigured: Boolean(PIXEL_ID),
     tokenConfigured: Boolean(ACCESS_TOKEN),
     testEventMode: Boolean(TEST_EVENT_CODE),
+    botConfigured: Boolean(TELEGRAM_BOT_TOKEN),
   });
+});
+
+// POST /api/session — called by the browser on button click before the bot redirect.
+// Stores fbp/fbc and returns a short-lived token that is passed to the bot as /start payload.
+app.post("/api/session", rateLimit, (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) {
+    return res.status(503).json({ ok: false, error: "Bot not configured." });
+  }
+  const { fbp, fbc, event_source_url, event_id } = req.body || {};
+  const token = crypto.randomBytes(16).toString("hex");
+  sessionStore.set(token, {
+    fbp: typeof fbp === "string" ? fbp.slice(0, 256) : "",
+    fbc: typeof fbc === "string" ? fbc.slice(0, 2048) : "",
+    eventSourceUrl: typeof event_source_url === "string" ? event_source_url.slice(0, 2048) : "",
+    leadEventId: typeof event_id === "string" ? event_id.slice(0, 128) : "",
+    clientIp: getClientIp(req),
+    userAgent: typeof req.headers["user-agent"] === "string"
+      ? req.headers["user-agent"].slice(0, 512)
+      : "",
+    telegramUserId: null,
+    createdAt: Date.now(),
+  });
+  return res.json({ ok: true, token });
+});
+
+// POST /telegram/webhook — receives updates from the Telegram Bot API.
+// Register with: https://api.telegram.org/bot<TOKEN>/setWebhook
+//   ?url=https://jack-tele-backend.onrender.com/telegram/webhook
+//   &secret_token=<TELEGRAM_WEBHOOK_SECRET>
+//   &allowed_updates=["message","chat_member"]
+app.post("/telegram/webhook", (req, res) => {
+  const secret = req.headers["x-telegram-bot-api-secret-token"];
+  if (!TELEGRAM_WEBHOOK_SECRET || secret !== TELEGRAM_WEBHOOK_SECRET) {
+    return res.status(403).end();
+  }
+  res.status(200).end(); // Respond to Telegram before any async work
+  handleTelegramUpdate(req.body).catch(() => {});
 });
 
 app.post("/api/meta/events", rateLimit, async (req, res) => {

@@ -4,7 +4,7 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "node --test test/meta-events.test.js",
+    "test": "node --test test/meta-events.test.js test/telegram-webhook.test.js",
     "start": "node server.js"
   },
   "keywords": [],
